@@ -1,6 +1,7 @@
 """
-人脸搜索工具 - Face Searcher
-功能：上传一张人脸照片，搜索指定文件夹中包含该人物的所有图片和视频
+人脸搜索工具 - Face Searcher (轻量版)
+功能：上传一张人脸照片，搜索指定文件夹中包含该人物的所有图片
+依赖：opencv-python, numpy, Pillow (都是标准库，容易打包)
 """
 
 import tkinter as tk
@@ -8,39 +9,60 @@ from tkinter import ttk, filedialog, messagebox
 import os
 import threading
 import pickle
-import json
-from datetime import datetime
 import cv2
 import numpy as np
 from PIL import Image, ImageTk
 import subprocess
-import sys
-
-# 尝试导入 face_recognition，如果不可用则使用备用方案
-try:
-    import face_recognition
-    USE_FACE_RECOGNITION = True
-except ImportError:
-    USE_FACE_RECOGNITION = False
-    print("警告: face_recognition 库未安装，将使用简单方案")
+import hashlib
 
 # ============ 配置 ============
 APP_NAME = "人脸搜索工具"
-APP_VERSION = "1.0"
+APP_VERSION = "1.1"
 CACHE_FILE = "face_cache.pkl"
-SUPPORTED_FORMATS = ['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.mp4', '.avi', '.mov', '.mkv']
+
+# OpenCV 内置的 Haar Cascade 人脸检测器（无需额外下载）
+FACE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+SUPPORTED_FORMATS = ['.jpg', '.jpeg', '.png', '.bmp', '.gif']
 
 # ============ 人脸识别核心 ============
 class FaceSearcher:
     def __init__(self):
-        self.known_encodings = []
-        self.known_paths = []
-        self.cache_loaded = False
+        self.known_faces = []  # 存储 (人脸特征, 文件路径)
+        self.folder_path = ""
+    
+    def get_face_feature(self, image):
+        """提取人脸特征（使用简单的图像哈希）"""
+        if image is None:
+            return None
+        
+        # 转为灰度
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        
+        # 人脸检测
+        faces = FACE_CASCADE.detectMultiScale(gray, 1.1, 4)
+        
+        if len(faces) == 0:
+            return None
+        
+        # 取最大的人脸
+        x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+        
+        # 提取人脸区域
+        face_roi = gray[y:y+h, x:x+w]
+        
+        # 调整大小并计算特征
+        face_resized = cv2.resize(face_roi, (100, 100))
+        
+        # 使用 HOG 特征或其他简单特征
+        features = face_resized.flatten()
+        
+        return features
     
     def extract_faces_from_folder(self, folder_path, progress_callback=None):
-        """扫描文件夹，提取所有人脸特征"""
-        self.known_encodings = []
-        self.known_paths = []
+        """扫描文件夹，提取所有人脸"""
+        self.known_faces = []
+        self.folder_path = folder_path
         
         files = []
         for root, dirs, filenames in os.walk(folder_path):
@@ -49,94 +71,71 @@ class FaceSearcher:
                     files.append(os.path.join(root, f))
         
         total = len(files)
+        
         for i, file_path in enumerate(files):
             try:
-                if file_path.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
-                    # 视频文件：提取关键帧
-                    encodings = self.extract_faces_from_video(file_path)
-                else:
-                    # 图片文件
-                    image = face_recognition.load_image_file(file_path)
-                    encodings = face_recognition.face_encodings(image)
-                
-                for enc in encodings:
-                    self.known_encodings.append(enc)
-                    self.known_paths.append(file_path)
-                
-            except Exception as e:
+                img = cv2.imread(file_path)
+                if img is not None:
+                    feature = self.get_face_feature(img)
+                    if feature is not None:
+                        self.known_faces.append((feature, file_path))
+            except:
                 pass
             
-            if progress_callback:
+            if progress_callback and (i + 1) % 10 == 0:
                 progress_callback(i + 1, total)
         
-        self.save_cache(folder_path)
-        return len(self.known_encodings)
+        self.save_cache()
+        return len(self.known_faces)
     
-    def extract_faces_from_video(self, video_path):
-        """从视频中提取人脸"""
-        encodings = []
-        try:
-            cap = cv2.VideoCapture(video_path)
-            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            # 每隔几帧取一次，避免太多
-            step = max(1, frame_count // 10)
-            
-            for i in range(0, frame_count, step):
-                cap.set(cv2.CAP_PROP_POS_FRAMES, i)
-                ret, frame = cap.read()
-                if ret:
-                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    face_encs = face_recognition.face_encodings(rgb_frame)
-                    encodings.extend(face_encs)
-            cap.release()
-        except:
-            pass
-        return encodings
-    
-    def search(self, target_image_path, threshold=0.6):
+    def search(self, target_image_path, threshold=0.7):
         """搜索目标人物"""
-        if not self.known_encodings:
+        if not self.known_faces:
             return []
         
-        target_image = face_recognition.load_image_file(target_image_path)
-        target_encodings = face_recognition.face_encodings(target_image)
-        
-        if not target_encodings:
+        target_img = cv2.imread(target_image_path)
+        if target_img is None:
             return []
         
-        target_encoding = target_encodings[0]
+        target_feature = self.get_face_feature(target_img)
+        if target_feature is None:
+            messagebox.showwarning("未检测到人脸", "目标图片中未检测到人脸，请换一张照片")
+            return []
+        
         results = []
         
-        for i, known_enc in enumerate(self.known_encodings):
-            distance = np.linalg.norm(known_enc - target_encoding)
-            if distance < threshold:
+        for known_feature, file_path in self.known_faces:
+            # 计算相似度
+            corr = np.corrcoef(target_feature, known_feature)[0, 1]
+            
+            if corr > threshold:
                 results.append({
-                    'path': self.known_paths[i],
-                    'distance': distance,
-                    'count': results.count(lambda x: x['path'] == self.known_paths[i])
+                    'path': file_path,
+                    'similarity': corr
                 })
         
-        # 按路径分组，统计每个文件匹配到的人脸数
-        path_counts = {}
+        # 按相似度排序
+        results.sort(key=lambda x: -x['similarity'])
+        
+        # 按文件分组
+        path_groups = {}
         for r in results:
             path = r['path']
-            if path not in path_counts:
-                path_counts[path] = {'path': path, 'count': 0, 'min_distance': 1.0}
-            path_counts[path]['count'] += 1
-            path_counts[path]['min_distance'] = min(path_counts[path]['min_distance'], r['distance'])
+            if path not in path_groups:
+                path_groups[path] = {'path': path, 'count': 0, 'max_similarity': 0}
+            path_groups[path]['count'] += 1
+            path_groups[path]['max_similarity'] = max(path_groups[path]['max_similarity'], r['similarity'])
         
-        # 按匹配人脸数排序
-        sorted_results = sorted(path_counts.values(), key=lambda x: (-x['count'], x['min_distance']))
+        sorted_results = sorted(path_groups.values(), key=lambda x: -x['max_similarity'])
         return sorted_results
     
-    def save_cache(self, folder_path):
+    def save_cache(self):
         """保存缓存"""
         try:
             with open(CACHE_FILE, 'wb') as f:
                 pickle.dump({
-                    'encodings': self.known_encodings,
-                    'paths': self.known_paths,
-                    'folder': folder_path
+                    'faces': self.known_faces,
+                    'folder': self.folder_path
                 }, f)
         except:
             pass
@@ -148,8 +147,8 @@ class FaceSearcher:
                 with open(CACHE_FILE, 'rb') as f:
                     data = pickle.load(f)
                     if data.get('folder') == folder_path:
-                        self.known_encodings = data.get('encodings', [])
-                        self.known_paths = data.get('paths', [])
+                        self.known_faces = data.get('faces', [])
+                        self.folder_path = folder_path
                         return True
         except:
             pass
@@ -170,7 +169,6 @@ class FaceSearchApp:
         
         self.setup_ui()
         
-        # 尝试设置主题
         try:
             style = ttk.Style()
             style.theme_use('clam')
@@ -255,7 +253,7 @@ class FaceSearchApp:
         tk.Label(result_frame, text="📋 搜索结果", font=("微软雅黑", 12, "bold"), 
                 bg="white").pack(pady=10)
         
-        # 结果列表（带滚动条）
+        # 结果列表
         scroll_y = tk.Scrollbar(result_frame)
         scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
         
@@ -287,22 +285,22 @@ class FaceSearchApp:
         """显示图片"""
         try:
             img = Image.open(path)
-            img.thumbnail((200, 150) if not max_size else max_size)
+            img.thumbnail((200, 150))
             photo = ImageTk.PhotoImage(img)
             label.config(image=photo, text="")
             label.image = photo
         except Exception as e:
-            label.config(text=f"无法加载图片")
+            label.config(text=f"无法加载")
     
     def select_folder(self):
         """选择文件夹"""
         path = filedialog.askdirectory(title="选择照片文件夹")
         if path:
             self.folder_path = path
-            self.folder_label.config(text=os.path.basename(path)[:20] + "..." if len(os.path.basename(path)) > 20 else os.path.basename(path))
+            name = os.path.basename(path)
+            self.folder_label.config(text=name[:20] + "..." if len(name) > 20 else name)
             self.status_label.config(text=f"已选择: {path}")
             
-            # 检查是否有缓存
             if self.searcher.load_cache(path):
                 self.status_label.config(text="已加载缓存")
                 self.check_search_ready()
@@ -312,7 +310,7 @@ class FaceSearchApp:
     
     def check_search_ready(self):
         """检查是否准备好搜索"""
-        if self.target_image_path and self.folder_path and self.searcher.known_encodings:
+        if self.target_image_path and self.folder_path and self.searcher.known_faces:
             self.search_btn.config(state=tk.NORMAL)
         else:
             self.search_btn.config(state=tk.DISABLED)
@@ -380,10 +378,10 @@ class FaceSearchApp:
         self.search_results = results
         self.result_listbox.insert(tk.END, f"找到 {len(results)} 个匹配文件:\n")
         
-        for r in results[:100]:  # 最多显示100个
+        for r in results[:100]:
             name = os.path.basename(r['path'])
-            count = r['count']
-            self.result_listbox.insert(tk.END, f"  📷 {name} (匹配{count}次)")
+            sim = int(r['max_similarity'] * 100)
+            self.result_listbox.insert(tk.END, f"  📷 {name} (相似度{sim}%)")
         
         if len(results) > 100:
             self.result_listbox.insert(tk.END, f"\n... 还有 {len(results) - 100} 个结果")
@@ -394,7 +392,6 @@ class FaceSearchApp:
         if selection:
             content = self.result_listbox.get(selection[0])
             if content.startswith("  📷"):
-                # 提取文件路径
                 for r in self.search_results:
                     if os.path.basename(r['path']) in content:
                         try:
@@ -405,12 +402,6 @@ class FaceSearchApp:
 
 # ============ 主程序 ============
 def main():
-    # 检查依赖
-    if not USE_FACE_RECOGNITION:
-        messagebox.showerror("依赖缺失", 
-            "请先安装必要的库:\n\npip install face_recognition dlib numpy opencv-python Pillow\n\n或者下载预编译的 dlib wheel 文件")
-        return
-    
     root = tk.Tk()
     app = FaceSearchApp(root)
     root.mainloop()
