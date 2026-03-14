@@ -21,7 +21,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install face-recognition dlib numpy opencv-python Pillow pyinstaller
+          pip install opencv-python numpy Pillow pyinstaller
           
       - name: Build EXE
         run: pyinstaller --onefile --windowed --name "人脸搜索工具" face_searcher.py
